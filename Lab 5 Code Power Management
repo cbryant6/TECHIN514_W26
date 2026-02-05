@@ -1,0 +1,196 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include "esp_sleep.h"
+
+// FirebaseClient RTDB
+#define ENABLE_DATABASE
+#include <FirebaseClient.h>
+#include <FirebaseJson.h>
+
+// ---------------- Pins (your wiring) ----------------
+static const int TRIG_PIN = D5;
+static const int ECHO_PIN = D4;
+
+// ---------------- WiFi ----------------
+const char* WIFI_SSID = "esp32_lab";
+const char* WIFI_PASS = "12345678";
+
+// ---------------- Firebase RTDB ----------------
+const char* DATABASE_URL = "https://esp-project-5371e-default-rtdb.firebaseio.com/";
+
+// ---------------- FirebaseClient objects ----------------
+WiFiClientSecure ssl;
+AsyncClientClass client(ssl);
+FirebaseApp app;
+RealtimeDatabase Database;
+AsyncResult result;
+NoAuth noAuth;
+
+// ---------------- Policy knobs (edit these for the lab) ----------------
+static const uint32_t WAKE_PERIOD_S          = 10;   // wake every 10 seconds
+static const float    MOTION_DELTA_CM       = 25.0; // motion threshold vs baseline
+static const uint32_t CONFIRM_WINDOW_S      = 30;   // stay awake sampling for 30s after motion
+static const uint32_t CONFIRM_SAMPLE_MS     = 1000; // 1 Hz during confirm window
+static const uint32_t HEARTBEAT_PERIOD_S    = 1800; // 30 minutes heartbeat
+
+// ---------------- RTC memory (survives deep sleep) ----------------
+RTC_DATA_ATTR float baseline_cm = -1.0f;
+RTC_DATA_ATTR uint32_t bootCount = 0;
+RTC_DATA_ATTR uint32_t eventCount = 0;
+RTC_DATA_ATTR uint32_t lastHeartbeat_s = 0;
+
+// ---------------- Utility: ultrasonic distance ----------------
+float readDistanceCmOnce() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration_us = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration_us == 0) return -1.0f;
+
+  return (duration_us * 0.0343f) / 2.0f;
+}
+
+float readDistanceMedian3() {
+  float a = readDistanceCmOnce(); delay(60);
+  float b = readDistanceCmOnce(); delay(60);
+  float c = readDistanceCmOnce();
+
+  // handle invalids quickly
+  if (a < 0 && b < 0) return c;
+  if (a < 0 && c < 0) return b;
+  if (b < 0 && c < 0) return a;
+
+  // median of 3
+  if ((a <= b && b <= c) || (c <= b && b <= a)) return b;
+  if ((b <= a && a <= c) || (c <= a && a <= b)) return a;
+  return c;
+}
+
+// ---------------- WiFi helpers ----------------
+bool wifiConnect(uint32_t timeout_ms = 15000) {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);            // keep radio stable for connection burst
+  WiFi.disconnect(true, true);
+  delay(200);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeout_ms) {
+    delay(250);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void wifiOff() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+}
+
+// ---------------- Firebase helpers ----------------
+void firebaseInit() {
+  ssl.setInsecure();
+  initializeApp(client, app, getAuth(noAuth));
+  app.getApp<RealtimeDatabase>(Database);
+  Database.url(DATABASE_URL);
+  client.setAsyncResult(result);
+}
+
+bool fbSetFloat(const char* path, float v) {
+  Database.set<float>(client, path, v, result);
+  return !result.isError();
+}
+
+bool fbSetUInt(const char* path, uint32_t v) {
+  Database.set<uint32_t>(client, path, v, result);
+  return !result.isError();
+}
+
+bool fbSetInt(const char* path, int v) {
+  Database.set<int>(client, path, v, result);
+  return !result.isError();
+}
+
+// ---------------- Sleep ----------------
+void goDeepSleep(uint32_t seconds) {
+  wifiOff();
+  esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// ---------------- Main ----------------
+void setup() {
+  bootCount++;
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // current distance (low-power measurement, no WiFi)
+  float d = readDistanceMedian3();
+
+  // initialize baseline on first boot or invalid baseline
+  if (baseline_cm < 0 || baseline_cm > 500) {
+    baseline_cm = d;
+  }
+
+  float delta = fabsf(d - baseline_cm);
+  bool motion = (d > 0) && (baseline_cm > 0) && (delta >= MOTION_DELTA_CM);
+
+  // slowly adapt baseline when NO motion (prevents drift sensitivity)
+  if (!motion && d > 0) {
+    baseline_cm = 0.90f * baseline_cm + 0.10f * d;
+  }
+
+  // Decide if we should upload:
+  // - upload on motion
+  // - upload heartbeat every HEARTBEAT_PERIOD_S
+  uint32_t now_s = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+  bool heartbeat_due = (lastHeartbeat_s == 0) || ((now_s - lastHeartbeat_s) >= HEARTBEAT_PERIOD_S);
+
+  if (motion || heartbeat_due) {
+    if (wifiConnect()) {
+      firebaseInit();
+
+      // Upload minimal payload (short WiFi time)
+      fbSetUInt("/lab/bootCount", bootCount);
+      fbSetFloat("/lab/distance_cm", d);
+      fbSetFloat("/lab/baseline_cm", baseline_cm);
+      fbSetFloat("/lab/delta_cm", delta);
+
+      if (motion) {
+        eventCount++;
+        fbSetInt("/lab/motion", 1);
+        fbSetUInt("/lab/eventCount", eventCount);
+      } else {
+        fbSetInt("/lab/motion", 0);
+      }
+
+      // heartbeat marker
+      if (heartbeat_due) {
+        lastHeartbeat_s = now_s;
+        fbSetUInt("/lab/heartbeat_s", lastHeartbeat_s);
+      }
+    }
+    wifiOff();
+  }
+
+  // If motion detected, stay awake for CONFIRM_WINDOW_S to capture activity spikes
+  if (motion) {
+    uint32_t start = millis();
+    while (millis() - start < CONFIRM_WINDOW_S * 1000UL) {
+      // 1 Hz sampling during confirm window (keeps CPU awake, shows active current)
+      (void)readDistanceMedian3();
+      delay(CONFIRM_SAMPLE_MS);
+    }
+  }
+
+  // Back to deep sleep for the wake period
+  goDeepSleep(WAKE_PERIOD_S);
+}
+
+void loop() {}
